@@ -1,0 +1,139 @@
+# great_company_app.py
+
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="Great Company Screener", layout="wide")
+
+st.title("📈 Great Company Strategy – S&P 500 Screener")
+st.markdown("Screen for high-quality S&P 500 stocks based on strict fundamentals.")
+
+# --- Helper function ---
+@st.cache_data
+def get_sp500_tickers():
+    sp500_df = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+    return sp500_df["Symbol"].str.replace(".", "-", regex=False).tolist()
+
+def grab_fundamentals(ticker: str):
+    tk = yf.Ticker(ticker)
+    try:
+        is_ = tk.get_income_stmt(freq="trailing").iloc[:, 0]
+    except:
+        is_ = (getattr(tk, "ttm_income_stmt", tk.income_stmt)).iloc[:, 0]
+
+    try:
+        bs_ = tk.get_balance_sheet(freq="yearly").iloc[:, 0]
+    except:
+        bs_ = tk.balance_sheet.iloc[:, 0]
+
+    try:
+        cf_ = tk.get_cashflow(freq="trailing").iloc[:, 0]
+    except:
+        cf_ = (getattr(tk, "ttm_cashflow", tk.cashflow)).iloc[:, 0]
+
+    info = tk.info
+    price = tk.history(period="1d")["Close"][-1]
+
+    equity = bs_.get("TotalStockholderEquity") or bs_.get("CommonStockholderEquity") or bs_.get("TotalEquityGrossMinorityInterest") or np.nan
+    total_debt = bs_.get("TotalDebt") or bs_.get("LongTermDebt") or np.nan
+    cash_eq = bs_.get("CashAndCashEquivalents") or 0
+
+    net_income = is_.get("NetIncome")
+    shares_out = info.get("sharesOutstanding")
+    gross_profit = is_.get("GrossProfit")
+    revenue = is_.get("TotalRevenue")
+    ebitda = cf_.get("Ebitda") or is_.get("EBITDA")
+    mcap = info.get("marketCap")
+    enterprise_value = (mcap or 0) + (total_debt or 0) - (cash_eq or 0)
+    sector = info.get("sector", "Unknown")
+
+    return pd.Series({
+        "rev": revenue,
+        "gross": gross_profit,
+        "ebitda": ebitda,
+        "net_inc": net_income,
+        "equity": equity,
+        "shares": shares_out,
+        "price": price,
+        "mcap": mcap,
+        "ev": enterprise_value,
+        "total_debt": total_debt,
+        "sector": sector
+    })
+
+# --- Sidebar ---
+st.sidebar.header("Settings")
+num_stocks = st.sidebar.slider("Number of S&P 500 Stocks to Sample", 10, 100, 50)
+show_chart = st.sidebar.checkbox("Show Bar Chart", value=True)
+
+# --- Main logic ---
+sp_tickers = get_sp500_tickers()
+tickers_to_check = sp_tickers[:num_stocks]
+
+data = {}
+for t in tickers_to_check:
+    try:
+        data[t] = grab_fundamentals(t)
+    except Exception as e:
+        st.warning(f"{t}: {e}")
+
+funds = pd.DataFrame(data).T
+funds = funds.dropna(subset=["equity", "rev", "ebitda", "net_inc", "shares"])
+funds["sector"] = funds["sector"].fillna("Unknown")
+
+# --- Metrics ---
+funds["GP%"]       = 100 * funds["gross"]  / funds["rev"]
+funds["EBITDA%"]   = 100 * funds["ebitda"] / funds["rev"]
+funds["ROE%"]      = 100 * funds["net_inc"] / funds["equity"]
+funds["PE"]        = funds["price"] / (funds["net_inc"] / funds["shares"])
+funds["EV/EBITDA"] = funds["ev"] / funds["ebitda"]
+funds["D/E%"]      = 100 * funds["total_debt"] / funds["equity"]
+
+# --- Sector means ---
+sector_means = funds.groupby("sector")[["GP%", "EBITDA%", "ROE%", "PE", "EV/EBITDA", "D/E%"]].transform("mean")
+sector_means.columns = [f"{col}_sector" for col in sector_means]
+funds = pd.concat([funds, sector_means], axis=1)
+
+# --- Rules (STRICT) ---
+rules = {
+    "rule1_GP"    : (funds["GP%"] >= 35) | (funds["GP%"] >= funds["GP%_sector"]),
+    "rule2_EBITDA": (funds["EBITDA%"] >= 15) | (funds["EBITDA%"] >= funds["EBITDA%_sector"]),
+    "rule3_ROE"   : (funds["ROE%"] > 0) & (funds["ROE%"] >= 15) & (funds["ROE%"] >= funds["ROE%_sector"]),
+    "rule4_PE"    : (funds["PE"] > 0) & (funds["PE"] <= 20) & (funds["PE"] <= funds["PE_sector"]),
+    "rule5_EVEBIT": (funds["EV/EBITDA"] > 0) & (funds["EV/EBITDA"] <= 10) & (funds["EV/EBITDA"] <= funds["EV/EBITDA_sector"]),
+    "rule6_DE"    : (funds["D/E%"] > 0) & (funds["D/E%"] <= 50) & (funds["D/E%"] <= funds["D/E%_sector"]),
+}
+
+for k, v in rules.items():
+    funds[k] = v
+
+funds["Greatness_Score"] = funds[[*rules]].sum(axis=1) / 6 * 100
+funds["Great_Company?"] = np.where(funds["Greatness_Score"] >= 80, "YES", "NO")
+
+# --- Results table ---
+st.subheader("📊 Great Company Rankings")
+cols = ["GP%", "EBITDA%", "ROE%", "PE", "EV/EBITDA", "D/E%", "Greatness_Score", "Great_Company?"]
+st.dataframe(funds[cols].round(2).sort_values("Greatness_Score", ascending=False))
+
+# --- Optional chart ---
+if show_chart:
+    top = funds.sort_values("Greatness_Score", ascending=False).head(20)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    bars = ax.bar(top.index, top["Greatness_Score"], color="#2E8B57")
+    for i, bar in enumerate(bars):
+        if top["Great_Company?"].iloc[i] == "YES":
+            bar.set_color("#006400")
+    ax.axhline(80, color="gray", linestyle="--", label="Greatness Threshold (80%)")
+    ax.set_xticks(range(len(top.index)))
+    ax.set_xticklabels(top.index, rotation=45, ha="right")
+    ax.set_ylabel("Greatness Score (%)")
+    ax.set_title("Top 20 Companies by Greatness Score")
+    ax.legend()
+    st.pyplot(fig)
+
+# --- CSV download ---
+csv = funds.to_csv().encode("utf-8")
+st.download_button("📥 Download CSV", data=csv, file_name="great_companies_screener.csv", mime="text/csv")
